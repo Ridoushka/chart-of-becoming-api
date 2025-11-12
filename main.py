@@ -14,10 +14,12 @@ SIGNS = [
 ]
 
 def deg_to_sign(deg):
+    """Convert raw degree to zodiac sign and degree within the sign."""
     deg = deg % 360.0
     sign_index = int(deg // 30)
     sign_deg = round(deg % 30, 2)
     return SIGNS[sign_index], sign_deg
+
 
 def get_ut_hours(date_str, time_str, lat, lon, tz_str=None):
     """
@@ -54,9 +56,11 @@ def get_ut_hours(date_str, time_str, lat, lon, tz_str=None):
     ut_dt = local_dt.astimezone(pytz.UTC)
     return ut_dt.hour + ut_dt.minute / 60.0 + ut_dt.second / 3600.0
 
+
 @app.route("/")
 def home():
     return "Chart of Becoming API is running."
+
 
 @app.route("/natal", methods=["POST"])
 def natal():
@@ -64,9 +68,9 @@ def natal():
 
     date = data.get("date")       # "YYYY-MM-DD"
     time = data.get("time")       # "HH:MM"
-    lat = data.get("lat")         # "51.5"
-    lon = data.get("lon")         # "31.3"
-    tz = data.get("timezone")     # optional
+    lat = data.get("lat")         # e.g. "51.5"
+    lon = data.get("lon")         # e.g. "31.3"
+    tz = data.get("timezone")     # optional "+02:00"
 
     if not (date and time and lat and lon):
         return jsonify({
@@ -90,7 +94,7 @@ def natal():
         asc_sign, asc_sign_deg = deg_to_sign(asc_deg)
         mc_sign, mc_sign_deg = deg_to_sign(mc_deg)
 
-        # Planets Sun..Pluto
+        # Planet positions (Sun..Pluto)
         planet_ids = {
             "Sun": swe.SUN,
             "Moon": swe.MOON,
@@ -106,7 +110,9 @@ def natal():
 
         planets = {}
         for name, pid in planet_ids.items():
-            lon_p, _, _ = swe.calc_ut(jd_ut, pid)
+            # swe.calc_ut may return 2 or 3+ values depending on build; we only need longitude.
+            result = swe.calc_ut(jd_ut, pid)
+            lon_p = result[0]
             p_sign, p_deg = deg_to_sign(lon_p)
             planets[name] = {
                 "sign": p_sign,
@@ -122,7 +128,7 @@ def natal():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+
 if __name__ == "__main__":
     swe.set_ephe_path(".")
     app.run(host="0.0.0.0", port=8000)
-
