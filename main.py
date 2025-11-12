@@ -16,51 +16,55 @@ SIGNS = [
 def deg_to_sign(deg):
     """
     Convert raw degree to zodiac sign and degree within the sign.
-    Accepts either a float or a tuple/list (uses the first element).
+    Accepts float or tuple/list (uses first element).
     """
-    # If for any reason we get a tuple/list from swisseph, grab the first value.
     if isinstance(deg, (list, tuple)):
         deg = deg[0]
-
     deg = float(deg) % 360.0
     sign_index = int(deg // 30)
     sign_deg = round(deg % 30, 2)
     return SIGNS[sign_index], sign_deg
 
-def get_ut_hours(date_str, time_str, lat, lon, tz_str=None):
+def get_local_and_ut(date_str, time_str, lat, lon):
     """
-    Convert local birth time to UT hours.
-    1) If tz_str provided: use it.
-    2) Else: detect timezone from lat/lon and date via timezonefinder + pytz.
+    Build localized datetime for the birth moment using historical timezone
+    (from timezonefinder + pytz), then convert to UT and UT decimal hours.
     """
-    hour_str, minute_str = time_str.split(":")
-    h = int(hour_str)
-    m = int(minute_str)
-
-    # If explicit timezone given -> trust it
-    if tz_str:
-        sign = 1 if tz_str.startswith("+") else -1
-        off_h, off_m = tz_str[1:].split(":")
-        offset_hours = sign * (int(off_h) + int(off_m) / 60.0)
-        return (h + m / 60.0) - offset_hours
-
-    # Auto-detect timezone
-    year, month, day = map(int, date_str.split("-"))
-    local_naive = datetime(year, month, day, h, m)
+    y, m, d = map(int, date_str.split("-"))
+    hh, mm = map(int, time_str.split(":"))
+    naive = datetime(y, m, d, hh, mm)
 
     tz_name = tf.timezone_at(lat=lat, lng=lon)
     if not tz_name:
-        # If unknown: assume input already UT
-        return h + m / 60.0
+        # Fallback: if unknown tz, assume given time is already UT
+        ut_hours = hh + mm / 60.0
+        return {
+            "tz_name": None,
+            "utc_offset_hours": 0.0,
+            "local_dt_iso": naive.isoformat(),
+            "ut_dt_iso": datetime(y, m, d, hh, mm, tzinfo=pytz.UTC).isoformat(),
+            "ut_hours": ut_hours
+        }
 
     tz = pytz.timezone(tz_name)
+    # localize with historical rules (DST etc.)
     try:
-        local_dt = tz.localize(local_naive, is_dst=None)
+        local_dt = tz.localize(naive, is_dst=None)
     except Exception:
-        local_dt = tz.localize(local_naive, is_dst=False)
+        local_dt = tz.localize(naive, is_dst=False)
 
     ut_dt = local_dt.astimezone(pytz.UTC)
-    return ut_dt.hour + ut_dt.minute / 60.0 + ut_dt.second / 3600.0
+    offset = local_dt.utcoffset()
+    offset_hours = (offset.total_seconds() / 3600.0) if offset else 0.0
+    ut_hours = ut_dt.hour + ut_dt.minute / 60.0 + ut_dt.second / 3600.0
+
+    return {
+        "tz_name": tz_name,
+        "utc_offset_hours": round(offset_hours, 2),
+        "local_dt_iso": local_dt.isoformat(),
+        "ut_dt_iso": ut_dt.isoformat(),
+        "ut_hours": ut_hours
+    }
 
 @app.route("/")
 def home():
@@ -68,37 +72,37 @@ def home():
 
 @app.route("/natal", methods=["POST"])
 def natal():
-    data = request.get_json()
+    data = request.get_json(force=True, silent=True) or {}
 
-    date = data.get("date")       # "YYYY-MM-DD"
-    time = data.get("time")       # "HH:MM"
-    lat = data.get("lat")         # "51.5"
-    lon = data.get("lon")         # "31.3"
-    tz = data.get("timezone")     # optional "+02:00"
+    date = data.get("date")   # "YYYY-MM-DD"
+    time = data.get("time")   # "HH:MM"
+    lat = data.get("lat")     # e.g. "51.5"
+    lon = data.get("lon")     # e.g. "31.3"
 
+    # We intentionally IGNORE any provided "timezone" to avoid wrong offsets.
     if not (date and time and lat and lon):
-        return jsonify({
-            "error": "Missing required fields. Need: date, time, lat, lon. Timezone optional."
-        }), 400
+        return jsonify({"error": "Need: date, time, lat, lon"}), 400
 
     try:
         lat_f = float(lat)
         lon_f = float(lon)
 
-        ut = get_ut_hours(date, time, lat_f, lon_f, tz)
+        # Historical timezone + UT conversion
+        tzinfo = get_local_and_ut(date, time, lat_f, lon_f)
+        ut = tzinfo["ut_hours"]
 
-        year, month, day = map(int, date.split("-"))
-        jd_ut = swe.julday(year, month, day, ut)
+        y, m, d = map(int, date.split("-"))
+        jd_ut = swe.julday(y, m, d, ut)
 
-        # Houses & angles (Placidus)
+        # Houses & angles (Placidus, geocentric)
         houses, ascmc = swe.houses(jd_ut, lat_f, lon_f, b"P")
         asc_deg = ascmc[0]
-        mc_deg = ascmc[1]
+        mc_deg  = ascmc[1]
 
         asc_sign, asc_sign_deg = deg_to_sign(asc_deg)
-        mc_sign, mc_sign_deg = deg_to_sign(mc_deg)
+        mc_sign,  mc_sign_deg  = deg_to_sign(mc_deg)
 
-        # Planet positions (Sun..Pluto)
+        # Planet positions (Sun..Pluto) — tropical
         planet_ids = {
             "Sun": swe.SUN,
             "Moon": swe.MOON,
@@ -114,18 +118,28 @@ def natal():
 
         planets = {}
         for name, pid in planet_ids.items():
-            # swe.calc_ut return shape can vary; we only care about longitude.
-            result = swe.calc_ut(jd_ut, pid)
-            lon_p = result[0] if isinstance(result, (list, tuple)) else result
+            res = swe.calc_ut(jd_ut, pid)  # build can return tuple of varying length
+            lon_p = res[0] if isinstance(res, (list, tuple)) else res
             p_sign, p_deg = deg_to_sign(lon_p)
-            planets[name] = {
-                "sign": p_sign,
-                "deg": round(p_deg, 2)
-            }
+            planets[name] = {"sign": p_sign, "deg": round(p_deg, 2)}
 
         return jsonify({
+            "input_used": {
+                "date": date,
+                "time_local": time,
+                "lat": lat_f,
+                "lon": lon_f
+            },
+            "timezone_used": {
+                "tz_name": tzinfo["tz_name"],
+                "utc_offset_hours": tzinfo["utc_offset_hours"],
+                "local_datetime": tzinfo["local_dt_iso"],
+                "ut_datetime": tzinfo["ut_dt_iso"],
+                "ut_decimal_hours": round(tzinfo["ut_hours"], 6),
+                "jd_ut": jd_ut
+            },
             "Ascendant": {"sign": asc_sign, "deg": round(asc_sign_deg, 2)},
-            "MC": {"sign": mc_sign, "deg": round(mc_sign_deg, 2)},
+            "MC":        {"sign": mc_sign,  "deg": round(mc_sign_deg,  2)},
             "planets": planets
         })
 
@@ -134,4 +148,6 @@ def natal():
 
 if __name__ == "__main__":
     swe.set_ephe_path(".")
-    app.run(host="0.0.0.0", port=8000)
+    import os
+    port = int(os.environ.get("PORT", 8000))  # Render binds $PORT
+    app.run(host="0.0.0.0", port=port)
